@@ -1,0 +1,293 @@
+/* Simple Access Point with HTTP WebSocket Server Example
+
+   Wi-Fi SoftAP Example + Simple HTTPD Server Example
+
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_eth.h"
+#include "esp_mac.h"
+#include "esp_tls_crypto.h"
+#include <esp_http_server.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "esp_wifi_types.h"
+
+/* The examples use WiFi configuration that you can set via project configuration menu.
+
+   If you'd rather not, just change the below entries to strings with
+   the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
+*/
+
+#define EXAMPLE_ESP_WIFI_SSID      "ESP32-S2" //CONFIG_ESP_WIFI_SSID
+#define EXAMPLE_ESP_WIFI_PASS      "mypassword" //CONFIG_ESP_WIFI_PASSWORD
+#define EXAMPLE_MAX_STA_CONN        5 //CONFIG_ESP_MAX_STA_CONN
+
+
+/* A simple example that demonstrates how to create GET and POST
+ * handlers for the web server.
+ */
+
+static const char *TAG = "wifi_AP_WEBserver";
+
+// server handle
+static httpd_handle_t server = NULL;
+
+
+/*
+ * Structure holding server handle
+ * and internal socket fd in order
+ * to use out of request send
+ */
+struct async_resp_arg {
+    httpd_handle_t hd;   // server instance
+    int fd;              // session socket file descriptor
+};
+
+// The asynchronous response
+static void generate_async_hello_resp(void *arg)
+{
+    // Data format to be sent from the server as a response to the client
+    char http_string[250];
+    char *data_string = "Hello from ESP32 websocket server ...";
+    sprintf(http_string, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", strlen(data_string));
+
+    // Initialize asynchronous response data structure
+    struct async_resp_arg *resp_arg = (struct async_resp_arg *)arg;
+    httpd_handle_t hd = resp_arg->hd;
+    int fd = resp_arg->fd;
+
+    // Send data to the client
+    ESP_LOGI(TAG, "Executing queued work fd : %d", fd);
+    httpd_socket_send(hd, fd, http_string, strlen(http_string), 0);
+    httpd_socket_send(hd, fd, data_string, strlen(data_string), 0);
+
+    free(arg);
+}
+
+// Initialize a queue for asynchronous communication
+static esp_err_t async_get_handler(httpd_req_t *req)
+{
+    struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+    resp_arg->hd = req->handle;
+    resp_arg->fd = httpd_req_to_sockfd(req);
+    ESP_LOGI(TAG, "Queuing work fd : %d", resp_arg->fd);
+    httpd_queue_work(req->handle, generate_async_hello_resp, resp_arg);
+    return ESP_OK;
+}
+
+
+static const httpd_uri_t ws = {
+        .uri        = "/ws",
+        .method     = HTTP_GET,
+        .handler    = async_get_handler,
+        .user_ctx   = NULL,
+        .is_websocket = true
+};
+
+/* This handler allows the custom error handling functionality to be
+ * tested from client side. For that, when a PUT request 0 is sent to
+ * URI /ctrl, the /hello and /echo URIs are unregistered and following
+ * custom error handler http_404_error_handler() is registered.
+ * Afterwards, when /hello or /echo is requested, this custom error
+ * handler is invoked which, after sending an error message to client,
+ * either closes the underlying socket (when requested URI is /echo)
+ * or keeps it open (when requested URI is /hello). This allows the
+ * client to infer if the custom error handler is functioning as expected
+ * by observing the socket state.
+ */
+// esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
+// {
+//     if (strcmp("/hello", req->uri) == 0) {
+//         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/hello URI is not available");
+//         /* Return ESP_OK to keep underlying socket open */
+//         return ESP_OK;
+//     } else if (strcmp("/echo", req->uri) == 0) {
+//         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "/echo URI is not available");
+//         /* Return ESP_FAIL to close underlying socket */
+//         return ESP_FAIL;
+//     }
+//     /* For any other URI send 404 and close socket */
+//     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Some 404 error message");
+//     return ESP_FAIL;
+// }
+
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true; /// ???
+
+    // Start the httpd server
+    ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // Register the websocket handler
+        ESP_LOGI(TAG, "Registering URI handlers");
+        httpd_register_uri_handler(server, &ws);
+        return server;
+    }
+
+    ESP_LOGI(TAG, "Error starting server!");
+    return NULL;
+}
+
+static esp_err_t stop_webserver(httpd_handle_t server)
+{
+    // Stop the httpd server
+    return httpd_stop(server);
+}
+
+
+static void disconnect_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    httpd_handle_t* server = (httpd_handle_t*) arg;
+    if (*server) {
+        ESP_LOGI(TAG, "Stopping webserver");
+        if (stop_webserver(*server) == ESP_OK) {
+            *server = NULL;
+        } else {
+            ESP_LOGE(TAG, "Failed to stop http server");
+        }
+    }
+}
+
+
+static void connect_handler(void* arg, esp_event_base_t event_base,
+                            int32_t event_id, void* event_data)
+{
+    httpd_handle_t* server = (httpd_handle_t*) arg;
+    if (*server == NULL) {
+        ESP_LOGI(TAG, "Starting webserver");
+        *server = start_webserver();
+    }
+}
+
+//------------------------------------------------------------------------------
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+esp_err_t wifi_init_softap(void)
+{
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            .max_connection = EXAMPLE_MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    return ESP_OK;
+}
+
+// The asynchronous response
+static void send_data_to_all()
+{
+    // Data format to be sent from the server to the client
+        char http_string[250];
+        char *data_string = "sensor data";
+        sprintf(http_string, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", strlen(data_string));
+
+        size_t fds = EXAMPLE_MAX_STA_CONN;
+        int client_fds[EXAMPLE_MAX_STA_CONN] = {};
+
+        esp_err_t ret = httpd_get_client_list(server, &fds, client_fds);
+    
+        if (ret == ESP_OK) {
+            for (int i = 0; i < fds; i++) {
+                // Initialize asynchronous response data structure
+                httpd_handle_t hd = server; // server_handle
+                int fd = client_fds[i]; // fd of client
+
+                // Send data to the client
+                ESP_LOGI(TAG, "Sending test data, fd : %d", fd);
+                httpd_socket_send(hd, fd, http_string, strlen(http_string), 0);
+                httpd_socket_send(hd, fd, data_string, strlen(data_string), 0);
+            }
+        }   
+
+}
+
+void app_main(void)
+{
+
+    ESP_LOGI(TAG, "NVS init");
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    
+    ESP_LOGI(TAG, "Eventloop create");
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    
+    // start the wifi Access Point
+    ESP_LOGI(TAG, "init softAP");
+    ESP_ERROR_CHECK(wifi_init_softap());
+
+    /* Register event handlers to stop the server when Wi-Fi or Ethernet is disconnected,
+     * and re-start it upon connection.
+     */
+#ifdef CONFIG_EXAMPLE_CONNECT_WIFI
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
+#endif // CONFIG_EXAMPLE_CONNECT_WIFI
+#ifdef CONFIG_EXAMPLE_CONNECT_ETHERNET
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &disconnect_handler, &server));
+#endif // CONFIG_EXAMPLE_CONNECT_ETHERNET
+
+    /* Start the server for the first time */
+    server = start_webserver();
+
+    // infinite loop
+    while(1){
+        vTaskDelay(1000);
+        httpd_queue_work(server, send_data_to_all, NULL);
+    }
+
+}
