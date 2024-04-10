@@ -1,10 +1,11 @@
 | Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C6 | ESP32-H2 | ESP32-S2 | ESP32-S3 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- |
 
+
+***This is documentation from the esp-idf example project I started with but has been modified away from this. Some of the stuff below is helpful so just leaving it here.***
+
 # Websocket echo server
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
-This example demonstrates the HTTPD server using the WebSocket feature.
 
 ## How to Use Example
 
