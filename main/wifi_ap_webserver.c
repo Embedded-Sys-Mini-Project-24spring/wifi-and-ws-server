@@ -333,8 +333,13 @@ static void send_data_to_all()
 
                 // Send data to the client
                 ESP_LOGI(TAG, "Sending test data, fd : %d", fd);
-                httpd_socket_send(hd, fd, http_string, strlen(http_string), 0);
-                httpd_socket_send(hd, fd, data_string, strlen(data_string), 0);
+                httpd_ws_frame_t ws_pkt;
+                memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+                ws_pkt.payload = (uint8_t*)data_string;
+                ws_pkt.len = strlen(data_string);
+                ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+                httpd_ws_send_frame_async(hd, fd, &ws_pkt);
             }
         }   
 
